@@ -1,0 +1,220 @@
+tosca_definitions_version: cloudify_dsl_1_3
+
+imports:
+  - http://www.getcloudify.org/spec/cloudify/5.0.5/types.yaml
+  - plugin:cloudify-utilities-plugin
+  - plugin:cloudify-openstack-plugin?version= >=3
+  - plugin:cloudify-aws-plugin
+  - plugin:cloudify-ansible-plugin
+  - plugin:cloudify-kubernetes-plugin
+
+inputs:
+  openstack-external-network:
+    type: string
+    description: >
+      the openstack network name or Id to connect for external management
+    default:  { get_secret: openstack-external-network }
+
+  openstack-external-network-id:
+    type: string
+    description: >
+      the openstack network name or Id to connect for external management
+    default:  { get_secret: openstack-external-network }
+
+  centos-image-id:
+    type: string
+    description: >
+     centos image ID on private cloud
+    default:  { get_secret: centos_image_id }
+
+  centos-flavor-id:
+    type: string
+    description: >
+     centos flavor ID on private cloud
+    default:  { get_secret: centos_flavor_id }
+
+  keystone-region:
+    type: string
+    description: >
+     openstack region
+    default:  { get_secret: keystone_region}
+
+  app_instances:
+    type: string
+    description: >
+     number of application instances (dockers) to run
+    constraints:
+      - less_or_equal: 20
+    default:  1
+
+  opnstack_client_config:
+    type: dict
+    description: A dictionary containing the client configuration for Openstack. Default is for keystone v2. Provide an alternate input for keystone v3.
+    default:
+      username: { get_secret: openstack_username }
+      password: { get_secret: openstack_password }
+      project_name: { get_secret: openstack_tenant_name }
+      auth_url: { get_secret: openstack_auth_url }
+      region_name: { get_secret: openstack_region }
+
+node_templates:
+
+  aws-network:
+    type: cloudify.nodes.ServiceComponent
+    properties:
+      resource_config:
+        blueprint:
+          external_resource: false
+          id: aws-network-bp
+          blueprint_archive: https://github.com/cloudify-community/blueprint-examples/releases/download/5.0.5-61/aws-example-network.zip
+          main_file_name: blueprint.yaml
+        deployment:
+          id: aws-network
+          auto_inc_suffix: false
+
+  openstack-network:
+    type: cloudify.nodes.ServiceComponent
+    properties:
+      resource_config:
+        blueprint:
+          external_resource: false
+          id: openstack-network-bp
+          blueprint_archive: https://github.com/cloudify-community/blueprint-examples/releases/download/5.0.5-61/openstack-example-network.zip
+          main_file_name: blueprint.yaml
+        deployment:
+          id: openstack-network
+          auto_inc_suffix: false
+          inputs:
+            external_network_id: { get_input: [ openstack-external-network ] }
+            client_config_dict: { get_input: opnstack_client_config }
+
+  public-infra-vm:
+    type: cloudify.nodes.Root
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        start:
+          implementation: scripts/upload-cloud-infra.sh
+          inputs:
+              id: public-cloud-vm
+              blueprint_archive: https://github.com/cloudify-community/blueprint-examples/releases/download/5.0.5-61/db-lb-app-infrastructure.zip
+              main_file_name: aws.yaml
+          executor: central_deployment_agent
+          max_retries: 0
+        stop:
+          implementation: scripts/uninstall-infra.sh
+          inputs:
+              id: public-cloud-vm
+          executor: central_deployment_agent
+          max_retries: 0
+
+  private-infra-vm:
+    type: cloudify.nodes.Root
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        start:
+          implementation: scripts/upload-cloud-infra.sh
+          inputs:
+            id: private-cloud-vm
+            blueprint_archive: https://github.com/cloudify-community/blueprint-examples/releases/download/5.0.5-61/db-lb-app-infrastructure.zip
+            main_file_name: openstack.yaml
+          executor: central_deployment_agent
+          max_retries: 0
+        stop:
+          implementation: scripts/uninstall-infra.sh
+          inputs:
+            id: private-cloud-vm
+          executor: central_deployment_agent
+          max_retries: 0
+
+  aws-db:
+    type: cloudify.nodes.ServiceComponent
+    properties:
+      resource_config:
+        blueprint:
+          external_resource: false
+          id: aws-db-bp
+          blueprint_archive: https://github.com/cloudify-community/blueprint-examples/releases/download/5.0.5-61/db-lb-app-db.zip
+          main_file_name: public-cloud-application.yaml
+        deployment:
+          id: aws-db
+          auto_inc_suffix: false
+          inputs:
+            infrastructure--resource_name_prefix: db
+            infrastructure--network_deployment_name: aws-network
+    relationships:
+      - type: cloudify.relationships.connected_to
+        target: aws-network
+      - type: cloudify.relationships.contained_in
+        target: public-infra-vm
+
+  aws-lb:
+    type: cloudify.nodes.ServiceComponent
+    properties:
+      resource_config:
+        blueprint:
+          external_resource: false
+          id: aws-lb-bp
+          blueprint_archive: https://github.com/cloudify-community/blueprint-examples/releases/download/5.0.5-61/db-lb-app-lb.zip
+          main_file_name: public-cloud-application.yaml
+        deployment:
+          id: aws-lb
+          auto_inc_suffix: false
+          inputs:
+            infrastructure--resource_name_prefix: lb
+            infrastructure--network_deployment_name: aws-network
+            database_deployment: aws-db
+    relationships:
+      - type: cloudify.relationships.connected_to
+        target: aws-db
+      - type: cloudify.relationships.contained_in
+        target: public-infra-vm
+
+  wordpress-app:
+    type: cloudify.nodes.ServiceComponent
+    properties:
+      resource_config:
+        blueprint:
+          external_resource: false
+          id: wordpress-bp
+          blueprint_archive: https://github.com/moshemizrachi/Multicloud/archive/master.zip
+          main_file_name: application.yaml
+        deployment:
+          id: wordpress
+          auto_inc_suffix: true
+          inputs:
+            load_balancer_deployment: aws-lb
+            kubernetes_deployment: kubernetes
+#            current_suffix_index: { get_attribute: [ SELF, resource_config, deployment, current_suffix_index ] }
+    capabilities:
+      scalable:
+        properties:
+          default_instances: { get_input: app_instances }
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: kubernetes
+      - type: cloudify.relationships.connected_to
+        target: aws-lb
+
+  kubernetes:
+    type: cloudify.nodes.ServiceComponent
+    properties:
+      resource_config:
+        blueprint:
+          external_resource: false
+          id: kubernetes-bp
+          blueprint_archive: https://github.com/cloudify-community/blueprint-examples/releases/download/5.0.5-66/kubernetes-kubespray.zip
+          main_file_name: openstack.yaml
+        deployment:
+          id: kubernetes
+          auto_inc_suffix: false
+          inputs:
+            external_network_id: { get_input: [ openstack-external-network ] }
+            region_name: RegionOne
+            image_id: { get_input: [ centos-image-id ] }
+            flavor_id: { get_input: [ centos-flavor-id ] }
+            client_config_dict: { get_input: opnstack_client_config }
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: private-infra-vm
+      - type: cloudify.relationships.connected_to
+        target: openstack-network
